@@ -10,6 +10,8 @@ and loads it into a Pandas DataFrame.
 from io import BytesIO
 from urllib.parse import urljoin
 import hashlib
+import re
+
 import requests
 import pandas as pd
 import pdfplumber
@@ -17,7 +19,15 @@ from bs4 import BeautifulSoup
 
 
 INDEX_URL = "https://pmbejd.org.za/index.php/household-affordability-index"
-TARGET_HEADER = "Household Food Basket: Per area, compared"
+
+# Stable part of the title (month/year + section number vary)
+TARGET_TITLE_REGEX = re.compile(
+    r"(?:\d+\.\s*)?"                  # optional section number like "8. "
+    r"(?:[A-Z]+\s+\d{4}\s+)?"         # optional month+year like "JANUARY 2026 "
+    r"Household\s+Food\s+Basket\s*:"  # "Household Food Basket:"
+    r"\s*Per\s+area\s*,\s*compared",  # "Per area, compared"
+    re.IGNORECASE,
+)
 
 EXPECTED_COLUMNS = {
     "foods tracked",
@@ -26,6 +36,22 @@ EXPECTED_COLUMNS = {
     "durban",
     "cape town",
 }
+
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+
+def _norm(s: str | None) -> str:
+    """Normalize PDF text/cell content for matching (collapse whitespace)."""
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def _title_matches(page_text: str) -> bool:
+    """Match the target table title while ignoring varying month/year/section."""
+    return bool(TARGET_TITLE_REGEX.search(page_text or ""))
 
 
 # -------------------------------------------------------------------
@@ -76,38 +102,57 @@ def download_pdf(pdf_url: str) -> tuple[bytes, str]:
 def extract_target_table(pdf_bytes: bytes) -> list[list[str]]:
     """
     Extract the 'Household Food Basket: Per area, compared' table
-    by ensuring the header text AND a matching table exist
-    on the same page.
+    from a multi-table PDF.
+
+    Strategy:
+    - Prefer pages where the title matches (regex that ignores month/year/section).
+    - On those pages, pick the table whose header contains EXPECTED_COLUMNS.
+    - If title detection fails due to PDF text quirks, fall back to scanning all pages
+      for a table with the expected header.
     """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-        for page_number, page in enumerate(pdf.pages, start=1):
-            page_text = (page.extract_text() or "").lower()
+        title_hit_pages: list[int] = []
 
-            # Skip pages without the target header text
-            if TARGET_HEADER.lower() not in page_text:
+        # Pass 1: pages with matching title
+        for page_number, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            if not _title_matches(page_text):
                 continue
 
-            tables = page.extract_tables()
-
-            # Skip if header text appears but no tables exist (e.g. index page)
+            title_hit_pages.append(page_number)
+            tables = page.extract_tables() or []
             if not tables:
+                # likely an index/contents mention of the title
                 continue
 
             for table in tables:
                 if not table or not table[0]:
                     continue
 
-                header = [cell.lower() for cell in table[0] if cell]
-
-                if EXPECTED_COLUMNS.issubset(set(header)):
+                header_norm = [_norm(cell) for cell in table[0] if _norm(cell)]
+                if EXPECTED_COLUMNS.issubset(set(header_norm)):
                     print(f"Target table found on page {page_number}")
                     return table
 
-            # Header was present, but tables didn't match structure
-            # → continue searching next pages instead of failing
+        # Pass 2: fallback scan (sometimes title text isn't extracted reliably)
+        for page_number, page in enumerate(pdf.pages, start=1):
+            tables = page.extract_tables() or []
+            for table in tables:
+                if not table or not table[0]:
+                    continue
+
+                header_norm = [_norm(cell) for cell in table[0] if _norm(cell)]
+                if EXPECTED_COLUMNS.issubset(set(header_norm)):
+                    print(f"Target table found on page {page_number} (fallback)")
+                    return table
+
+    if title_hit_pages:
+        raise RuntimeError(
+            f"Title matched on page(s) {title_hit_pages}, but no matching table was detected. "
+            "This can happen if the PDF table header format changed."
+        )
 
     raise RuntimeError("Household Food Basket table not found in PDF")
-
 
 
 # -------------------------------------------------------------------
@@ -124,6 +169,7 @@ def table_to_dataframe(table: list[list[str]]) -> pd.DataFrame:
     # Clean column names
     df.columns = (
         df.columns
+        .astype(str)
         .str.strip()
         .str.replace("\n", " ", regex=False)
         .str.replace("Averag", "Average", regex=False)
