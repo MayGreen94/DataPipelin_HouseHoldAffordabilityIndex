@@ -76,26 +76,38 @@ def download_pdf(pdf_url: str) -> tuple[bytes, str]:
 def extract_target_table(pdf_bytes: bytes) -> list[list[str]]:
     """
     Extract the 'Household Food Basket: Per area, compared' table
-    from a multi-table PDF.
+    by ensuring the header text AND a matching table exist
+    on the same page.
     """
     with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
             page_text = (page.extract_text() or "").lower()
 
+            # Skip pages without the target header text
             if TARGET_HEADER.lower() not in page_text:
                 continue
 
             tables = page.extract_tables()
+
+            # Skip if header text appears but no tables exist (e.g. index page)
+            if not tables:
+                continue
+
             for table in tables:
+                if not table or not table[0]:
+                    continue
+
                 header = [cell.lower() for cell in table[0] if cell]
+
                 if EXPECTED_COLUMNS.issubset(set(header)):
+                    print(f"Target table found on page {page_number}")
                     return table
 
-            raise RuntimeError(
-                f"Header found on page {page_number}, but matching table not detected"
-            )
+            # Header was present, but tables didn't match structure
+            # → continue searching next pages instead of failing
 
     raise RuntimeError("Household Food Basket table not found in PDF")
+
 
 
 # -------------------------------------------------------------------
